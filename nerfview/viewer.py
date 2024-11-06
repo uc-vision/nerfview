@@ -1,7 +1,7 @@
 import dataclasses
 import time
 from threading import Lock
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional, Tuple, Union
 
 import numpy as np
 import viser
@@ -30,13 +30,7 @@ class CameraState(object):
         return K
 
 
-@dataclasses.dataclass
-class ViewerState(object):
-    num_train_rays_per_sec: Optional[float] = None
-    num_view_rays_per_sec: float = 100000.0
-    status: Literal[
-        "rendering", "preparing", "training", "paused", "completed"
-    ] = "training"
+Status = Literal["rendering", "preparing", "training", "paused", "completed"]
 
 
 VIEWER_LOCK = Lock()
@@ -77,55 +71,54 @@ class Viewer(object):
                 Tuple[UInt8[np.ndarray, "H W 3"], Optional[Float32[np.ndarray, "H W"]]],
             ],
         ],
-        mode: Literal["rendering", "training"] = "rendering",
+        mode: Literal["rendering", "training"] = "rendering"
     ):
         # Public states.
         self.server = server
         self.render_fn = render_fn
         self.mode = mode
         self.lock = VIEWER_LOCK
-        self.state = ViewerState()
-        if self.mode == "rendering":
-            self.state.status = "rendering"
-
+        self.status: Status = mode
+        
         # Private states.
         self._renderers: dict[int, Renderer] = {}
+
         self._step: int = 0
         self._last_update_step: int = 0
         self._last_move_time: float = 0.0
+      
 
         server.on_client_disconnect(self._disconnect_client)
         server.on_client_connect(self._connect_client)
 
         self._define_guis()
 
+
+    def _metrics_text(self, metrics: dict[str, Any]) -> str:
+        def f(key: str, value: Any) -> str:
+            if isinstance(value, float):
+                return f"{key}: {value:.3f}"
+            elif isinstance(value, int):
+                return f"{key}: {value:d}"
+            else:
+                return f"{key}: {value}"
+
+        return f"""<sub>{" ".join(f(k, v) for k, v in metrics.items())}</sub>"""
+
+
     def _define_guis(self):
-        with self.server.gui.add_folder(
-            "Stats", visible=self.mode == "training"
-        ) as self._stats_folder:
-            self._stats_text_fn = (
-                lambda: f"""<sub>
-                Step: {self._step}\\
-                Last Update: {self._last_update_step}
-                </sub>"""
-            )
-            self._stats_text = self.server.gui.add_markdown(self._stats_text_fn())
+        with self.server.gui.add_folder("Stats") as self._stats_folder:
+            self._stats_text = self.server.gui.add_markdown(self._metrics_text(self.metrics))
 
         with self.server.gui.add_folder(
             "Training", visible=self.mode == "training"
         ) as self._training_folder:
             self._pause_train_button = self.server.gui.add_button("Pause")
-            self._pause_train_button.on_click(self._toggle_train_buttons)
-            self._pause_train_button.on_click(self._toggle_train_s)
+            self._pause_train_button.on_click(self._on_pause_train)
             self._resume_train_button = self.server.gui.add_button("Resume")
             self._resume_train_button.visible = False
-            self._resume_train_button.on_click(self._toggle_train_buttons)
-            self._resume_train_button.on_click(self._toggle_train_s)
+            self._resume_train_button.on_click(self._on_resume_train)
 
-            self._train_util_slider = self.server.gui.add_slider(
-                "Train Util", min=0.0, max=1.0, step=0.05, initial_value=0.9
-            )
-            self._train_util_slider.on_update(self.rerender)
 
         with self.server.gui.add_folder("Rendering") as self._rendering_folder:
             self._max_img_res_slider = self.server.gui.add_slider(
@@ -133,14 +126,16 @@ class Viewer(object):
             )
             self._max_img_res_slider.on_update(self.rerender)
 
-    def _toggle_train_buttons(self, _):
-        self._pause_train_button.visible = not self._pause_train_button.visible
-        self._resume_train_button.visible = not self._resume_train_button.visible
+    def _on_pause_train(self, _):
+        self.status = "paused"
+        self._pause_train_button.visible = False
+        self._resume_train_button.visible = True
 
-    def _toggle_train_s(self, _):
-        if self.state.status == "completed":
-            return
-        self.state.status = "paused" if self.state.status == "training" else "training"
+    def _on_resume_train(self, _):
+        self.status = "training"
+        self._pause_train_button.visible = True
+        self._resume_train_button.visible = False
+
 
     def rerender(self, _):
         clients = self.server.get_clients()
@@ -176,7 +171,10 @@ class Viewer(object):
                     [vt.SO3(camera.wxyz).as_matrix(), camera.position[:, None]], 1
                 ),
                 [[0, 0, 0, 1]],
-            ],
+            ],            # self._train_util_slider = self.server.gui.add_slider(
+            #     "Train Util", min=0.0, max=1.0, step=0.05, initial_value=0.9
+            # )
+            # self._train_util_slider.on_update(self.rerender)
             0,
         )
         return CameraState(
@@ -185,52 +183,34 @@ class Viewer(object):
             c2w=c2w,
         )
 
-    def update(self, step: int, num_train_rays_per_step: int):
-        if self.mode == "rendering":
-            raise ValueError("`update` method is only available in training mode.")
-        # Skip updating the viewer for the first few steps to allow
-        # `num_train_rays_per_sec` and `num_view_rays_per_sec` to stabilize.
-        if step < 5:
-            return
-        self._step = step
+    def update_training(self, metrics: dict[str, Any]):
+      
         with self.server.atomic(), self._stats_folder:
-            self._stats_text.content = self._stats_text_fn()
+            self._stats_text.content = self._stats_text_fn(metrics)
+
         if len(self._renderers) == 0:
             return
+        
         # Stop training while user moves camera to make viewing smoother.
         while time.time() - self._last_move_time < 0.1:
             time.sleep(0.05)
-        if self.state.status == "training" and self._train_util_slider.value != 1:
-            assert (
-                self.state.num_train_rays_per_sec is not None
-            ), "User must keep track of `num_train_rays_per_sec` to use `update`."
-            train_s = self.state.num_train_rays_per_sec
-            view_s = self.state.num_view_rays_per_sec
-            train_util = self._train_util_slider.value
-            view_n = self._max_img_res_slider.value**2
-            train_n = num_train_rays_per_step
-            train_time = train_n / train_s
-            view_time = view_n / view_s
-            update_every = (
-                train_util * view_time / (train_time - train_util * train_time)
-            )
-            if step > self._last_update_step + update_every:
-                self._last_update_step = step
-                clients = self.server.get_clients()
-                for client_id in clients:
-                    camera_state = self.get_camera_state(clients[client_id])
-                    assert camera_state is not None
-                    self._renderers[client_id].submit(
-                        RenderTask("update", camera_state)
-                    )
-                with self.server.atomic(), self._stats_folder:
-                    self._stats_text.content = self._stats_text_fn()
+
+            
+        if self.state.status == "training":        
+          clients = self.server.get_clients()
+          for client_id in clients:
+              camera_state = self.get_camera_state(clients[client_id])
+              assert camera_state is not None
+              self._renderers[client_id].submit(
+                  RenderTask("update", camera_state)
+              )
+          with self.server.atomic(), self._stats_folder:
+              self._stats_text.content = self._stats_text_fn(metrics)
 
     def complete(self):
         self.state.status = "completed"
         self._pause_train_button.disabled = True
         self._resume_train_button.disabled = True
-        self._train_util_slider.disabled = True
         with self.server.atomic(), self._stats_folder:
             self._stats_text.content = f"""<sub>
                 Step: {self._step}\\
