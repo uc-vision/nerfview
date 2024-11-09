@@ -1,15 +1,13 @@
-
 from dataclasses import dataclass
-import threading
 import time
-from typing import Callable, Literal, Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
-
 import viser
 import viser.transforms as vt
 
-from nerfview.types import CameraState
+from .types import CameraState
+
 
 
 @dataclass
@@ -17,6 +15,7 @@ class RenderConfig:
     jpeg_quality: int = 70
     max_render_res: int = 2048
     fast_render_scale: float = 0.5
+
 
 class RenderClient():
     def __init__(
@@ -65,13 +64,16 @@ class RenderClient():
             return int(max_size * aspect), max_size
 
 
-
     def render(self, image_scale: float):
         self.last_render = time.time()
 
         camera = self.get_camera_state()
-        image_size = self.get_image_size(image_scale * self.config.max_render_res, camera.aspect)
-        img, depth = self.render_fn(camera, image_size)
+        image_size = self.get_image_size(int(image_scale * self.config.max_render_res), camera.aspect)
+        rendered = self.render_fn(camera, image_size)
+        if isinstance(rendered, tuple):
+            img, depth = rendered
+        else:
+            img, depth = rendered, None
   
         self.client.scene.set_background_image(
             image=img, format="jpeg", 
